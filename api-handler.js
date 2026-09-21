@@ -8,6 +8,7 @@
 const ddlGenerator = require('./ddl-generator')
 const crudFactory = require('./handlers/crud-factory')
 const { autoExpandFrame, fitFrameToViews, clearEdgeWaypoints } = require('./handlers/shared-helpers')
+const fileTransfer = require('./handlers/file-transfer')
 
 // ============================================================
 // Family Configs & Routers
@@ -73,7 +74,8 @@ const ALLOWED_COLUMN_TYPES = [
     'BOOLEAN',
     'SMALLINT', 'INTEGER', 'INT', 'BIGINT', 'TINYINT',
     'FLOAT', 'DOUBLE', 'REAL', 'DECIMAL', 'NUMERIC',
-    'DATE', 'TIME', 'DATETIME', 'TIMESTAMP',
+    'DATE', 'TIME', 'DATETIME', 'TIMESTAMP', 'TIMESTAMPTZ',
+    'TEXT[]', 'CHAR(2)[]', 'INT4RANGE', 'DATERANGE', 'INT8RANGE',
     'BLOB', 'BINARY', 'VARBINARY',
     'UUID', 'JSON', 'JSONB', 'XML',
     'SERIAL', 'BIGSERIAL'
@@ -303,7 +305,7 @@ const GENERIC_RELATION_CREATE_FIELDS = ['type', 'sourceId', 'targetId', 'name']
 const DIAGRAM_AS_PARENT_TYPES = ['SysMLConstraintParameter']
 const GENERIC_CHILD_CREATE_FIELDS = ['type', 'name', 'field']
 const LAYOUT_ALLOWED_FIELDS = ['direction', 'separations', 'edgeLineStyle']
-const IMPORT_ALLOWED_FIELDS = ['path', 'parentId']
+const IMPORT_ALLOWED_FIELDS = ['file', 'parentId']
 const VALID_LAYOUT_DIRECTIONS = ['TB', 'BT', 'LR', 'RL']
 
 // ============================================================
@@ -812,7 +814,7 @@ const NOTE_LINK_ALLOWED_FIELDS = ['noteId', 'targetId']
 const FREE_LINE_ALLOWED_FIELDS = ['x1', 'y1', 'x2', 'y2']
 const VIEW_UPDATE_FIELDS = ['left', 'top', 'width', 'height']
 const GENERIC_ELEMENT_UPDATE_FIELDS = ['name', 'documentation']
-const EXPORT_ALLOWED_FIELDS = ['path', 'format']
+const EXPORT_ALLOWED_FIELDS = ['format']
 const VALID_EXPORT_FORMATS = ['png', 'jpeg', 'svg', 'pdf']
 
 // --- Shape (view-only) Constants ---
@@ -4261,27 +4263,39 @@ function getAllDiagrams(query, reqInfo) {
 
 // --- Diagram Image Export ---
 
+/**
+ * Export one diagram into absPath. PDF is written through a stream by StarUML,
+ * so the returned promise resolves when the file is complete.
+ */
+function writeDiagramImage(diagram, format, absPath) {
+    const nodePath = require('path')
+    const diagramExport = require(nodePath.join(app.getAppPath(), 'src', 'engine', 'diagram-export'))
+
+    if (format === 'pdf') {
+        diagramExport.exportToPDF([diagram], absPath, { showName: true })
+        return fileTransfer.waitForPdf(absPath)
+    }
+    if (format === 'svg') {
+        diagramExport.exportToSVG(diagram, absPath)
+    } else if (format === 'jpeg') {
+        diagramExport.exportToJPEG(diagram, absPath)
+    } else {
+        diagramExport.exportToPNG(diagram, absPath)
+    }
+    return Promise.resolve()
+}
+
+function diagramFileName(diagram, format) {
+    return (diagram.name || diagram._id).replace(/[/\\:*?"<>|]/g, '_') + '.' + format
+}
+
 function exportDiagramImage(id, body, reqInfo) {
     const err = validate([
         checkUnknownFields(body, EXPORT_ALLOWED_FIELDS),
-        checkFieldType(body, 'path', 'string'),
         checkFieldType(body, 'format', 'string')
     ])
     if (err) {
         return validationError(err, reqInfo, body)
-    }
-
-    if (!body.path) {
-        return validationError('Field "path" is required', reqInfo, body)
-    }
-
-    const pathErr = checkNonEmptyString(body, 'path')
-    if (pathErr) {
-        return validationError(pathErr, reqInfo, body)
-    }
-
-    if (body.path.charAt(0) !== '/' && !/^[a-zA-Z]:[/\\]/.test(body.path)) {
-        return validationError('Field "path" must be an absolute path', reqInfo, body)
     }
 
     const format = (body.format || 'png').toLowerCase()
@@ -4295,35 +4309,27 @@ function exportDiagramImage(id, body, reqInfo) {
     }
 
     const reqInfoWithBody = Object.assign({}, reqInfo, { body: body })
+    const nodePath = require('path')
+    const fileName = diagramFileName(diagram, format)
+    const tempDir = fileTransfer.makeTempDir()
 
-    try {
-        const nodePath = require('path')
-        const appPath = app.getAppPath()
-        const diagramExport = require(nodePath.join(appPath, 'src', 'engine', 'diagram-export'))
-
-        if (format === 'pdf') {
-            diagramExport.exportToPDF([diagram], body.path, { showName: true })
-        } else if (format === 'svg') {
-            diagramExport.exportToSVG(diagram, body.path)
-        } else if (format === 'jpeg') {
-            diagramExport.exportToJPEG(diagram, body.path)
-        } else {
-            diagramExport.exportToPNG(diagram, body.path)
-        }
-
+    return writeDiagramImage(diagram, format, nodePath.join(tempDir, fileName)).then(function () {
         return {
             success: true,
-            message: 'Exported diagram "' + (diagram.name || id) + '" as ' + format + ' to "' + body.path + '"',
+            message: 'Exported diagram "' + (diagram.name || id) + '" as ' + format,
             request: reqInfoWithBody,
-            data: { path: body.path, format: format }
+            data: { format: format, file: fileTransfer.readFileEntry(nodePath.join(tempDir, fileName), fileName) }
         }
-    } catch (e) {
+    }).catch(function (e) {
         return {
             success: false,
             error: 'Failed to export diagram: ' + (e.message || String(e)),
             request: reqInfoWithBody
         }
-    }
+    }).then(function (result) {
+        fileTransfer.removeTempDir(tempDir)
+        return result
+    })
 }
 
 // --- Notes ---
@@ -5053,30 +5059,22 @@ function getElement(id, reqInfo) {
 
 // --- DDL Generation ---
 
-const DDL_GENERATE_ALLOWED_FIELDS = ['path', 'dataModelId']
+const DDL_GENERATE_ALLOWED_FIELDS = ['fileName', 'dataModelId']
 
 function generatePostgresqlDDL(body, reqInfo) {
     const err = validate([
         checkUnknownFields(body, DDL_GENERATE_ALLOWED_FIELDS),
-        checkFieldType(body, 'path', 'string'),
+        checkFieldType(body, 'fileName', 'string'),
         checkFieldType(body, 'dataModelId', 'string')
     ])
     if (err) {
         return validationError(err, reqInfo, body)
     }
 
-    if (!body.path) {
-        return validationError('Field "path" is required', reqInfo, body)
-    }
-
-    const nameErr = checkNonEmptyString(body, 'path')
-    if (nameErr) {
-        return validationError(nameErr, reqInfo, body)
-    }
-
-    // Validate absolute path
-    if (body.path.charAt(0) !== '/' && !/^[a-zA-Z]:[/\\]/.test(body.path)) {
-        return validationError('Field "path" must be an absolute path (e.g. "/Users/.../output.sql")', reqInfo, body)
+    // The file name selects the output mode (*_create.sql / *_drop.sql). No file is written here.
+    const fileName = body.fileName || 'schema.sql'
+    if (fileName !== require('path').basename(fileName)) {
+        return validationError('Field "fileName" must be a plain file name without directories', reqInfo, body)
     }
 
     // Validate dataModelId if provided
@@ -5090,14 +5088,14 @@ function generatePostgresqlDDL(body, reqInfo) {
     const reqInfoWithBody = Object.assign({}, reqInfo, { body: body })
 
     try {
-        ddlGenerator.generate(body.path, body.dataModelId || null)
+        const ddl = ddlGenerator.generate(fileName, body.dataModelId || null)
 
         return {
             success: true,
-            message: 'DDL generated to "' + body.path + '"',
+            message: 'DDL generated',
             request: reqInfoWithBody,
             data: {
-                path: body.path
+                file: fileTransfer.textEntry(fileName, ddl)
             }
         }
     } catch (e) {
@@ -5894,53 +5892,50 @@ function layoutDiagram(diagramId, body, reqInfo) {
 function importProject(body, reqInfo) {
     const err = validate([
         checkUnknownFields(body, IMPORT_ALLOWED_FIELDS),
-        checkFieldType(body, 'path', 'string'),
         checkFieldType(body, 'parentId', 'string')
     ])
     if (err) {
         return validationError(err, reqInfo, body)
     }
 
-    if (!body.path) {
-        return validationError('Field "path" is required', reqInfo, body)
+    const fileErr = fileTransfer.checkFileEntry(body.file, 'file')
+    if (fileErr) {
+        return validationError(fileErr, reqInfo, { parentId: body.parentId })
     }
 
-    const pathErr = checkNonEmptyString(body, 'path')
-    if (pathErr) {
-        return validationError(pathErr, reqInfo, body)
-    }
-
-    if (body.path.charAt(0) !== '/' && !/^[a-zA-Z]:[/\\]/.test(body.path)) {
-        return validationError('Field "path" must be an absolute path', reqInfo, body)
-    }
+    // Do not echo the file content back in the response
+    const reqInfoWithBody = Object.assign({}, reqInfo, { body: { parentId: body.parentId, file: { path: body.file.path, encoding: body.file.encoding } } })
 
     let parent
     if (body.parentId) {
         parent = findById(body.parentId)
         if (!parent) {
-            return validationError('Parent not found: ' + body.parentId, reqInfo, body)
+            return { success: false, error: 'Parent not found: ' + body.parentId, request: reqInfoWithBody }
         }
     } else {
         parent = app.project.getProject()
         if (!parent) {
-            return validationError('No project found. Open a project first.', reqInfo, body)
+            return { success: false, error: 'No project found. Open a project first.', request: reqInfoWithBody }
         }
     }
 
+    const tempDir = fileTransfer.makeTempDir()
     try {
-        app.project.importFromFile(parent, body.path)
+        app.project.importFromFile(parent, fileTransfer.writeFileEntry(tempDir, body.file))
         return {
             success: true,
-            message: 'Imported from "' + body.path + '"',
-            request: Object.assign({}, reqInfo, { body: body }),
-            data: { path: body.path }
+            message: 'Imported "' + body.file.path + '"',
+            request: reqInfoWithBody,
+            data: { fileName: body.file.path }
         }
     } catch (e) {
         return {
             success: false,
             error: 'Failed to import: ' + (e.message || String(e)),
-            request: Object.assign({}, reqInfo, { body: body })
+            request: reqInfoWithBody
         }
+    } finally {
+        fileTransfer.removeTempDir(tempDir)
     }
 }
 
@@ -5950,29 +5945,15 @@ function importProject(body, reqInfo) {
 
 // --- 3B. Export All Diagrams ---
 
-const EXPORT_ALL_ALLOWED_FIELDS = ['path', 'format']
+const EXPORT_ALL_ALLOWED_FIELDS = ['format']
 
 function exportAllDiagrams(body, reqInfo) {
     const err = validate([
         checkUnknownFields(body, EXPORT_ALL_ALLOWED_FIELDS),
-        checkFieldType(body, 'path', 'string'),
         checkFieldType(body, 'format', 'string')
     ])
     if (err) {
         return validationError(err, reqInfo, body)
-    }
-
-    if (!body.path) {
-        return validationError('Field "path" is required', reqInfo, body)
-    }
-
-    const pathErr = checkNonEmptyString(body, 'path')
-    if (pathErr) {
-        return validationError(pathErr, reqInfo, body)
-    }
-
-    if (body.path.charAt(0) !== '/' && !/^[a-zA-Z]:[/\\]/.test(body.path)) {
-        return validationError('Field "path" must be an absolute path', reqInfo, body)
     }
 
     const format = (body.format || 'png').toLowerCase()
@@ -5985,40 +5966,48 @@ function exportAllDiagrams(body, reqInfo) {
         return validationError('No diagrams found in project', reqInfo, body)
     }
 
-    try {
-        const nodePath = require('path')
-        const appPath = app.getAppPath()
-        const diagramExport = require(nodePath.join(appPath, 'src', 'engine', 'diagram-export'))
+    const reqInfoWithBody = Object.assign({}, reqInfo, { body: body })
+    const nodePath = require('path')
+    const tempDir = fileTransfer.makeTempDir()
 
-        const exported = []
-        diagrams.forEach(function (diagram) {
-            const fileName = (diagram.name || diagram._id).replace(/[/\\:*?"<>|]/g, '_')
-            const filePath = nodePath.join(body.path, fileName + '.' + format)
-            if (format === 'pdf') {
-                diagramExport.exportToPDF([diagram], filePath, { showName: true })
-            } else if (format === 'svg') {
-                diagramExport.exportToSVG(diagram, filePath)
-            } else if (format === 'jpeg') {
-                diagramExport.exportToJPEG(diagram, filePath)
-            } else {
-                diagramExport.exportToPNG(diagram, filePath)
-            }
-            exported.push({ name: diagram.name, path: filePath })
+    // Diagrams may share a name; keep every file by numbering duplicates.
+    const usedNames = {}
+    const fileNames = diagrams.map(function (diagram) {
+        const base = diagramFileName(diagram, format)
+        usedNames[base] = (usedNames[base] || 0) + 1
+        if (usedNames[base] === 1) {
+            return base
+        }
+        return base.substring(0, base.length - format.length - 1) + '_' + usedNames[base] + '.' + format
+    })
+
+    let chain = Promise.resolve()
+    diagrams.forEach(function (diagram, i) {
+        chain = chain.then(function () {
+            return writeDiagramImage(diagram, format, nodePath.join(tempDir, fileNames[i]))
         })
+    })
 
+    return chain.then(function () {
+        const files = diagrams.map(function (diagram, i) {
+            return Object.assign({ name: diagram.name }, fileTransfer.readFileEntry(nodePath.join(tempDir, fileNames[i]), fileNames[i]))
+        })
         return {
             success: true,
-            message: 'Exported ' + exported.length + ' diagram(s) to "' + body.path + '"',
-            request: Object.assign({}, reqInfo, { body: body }),
-            data: { count: exported.length, format: format, files: exported }
+            message: 'Exported ' + files.length + ' diagram(s) as ' + format,
+            request: reqInfoWithBody,
+            data: { count: files.length, format: format, files: files }
         }
-    } catch (e) {
+    }).catch(function (e) {
         return {
             success: false,
             error: 'Failed to export diagrams: ' + (e.message || String(e)),
-            request: Object.assign({}, reqInfo, { body: body })
+            request: reqInfoWithBody
         }
-    }
+    }).then(function (result) {
+        fileTransfer.removeTempDir(tempDir)
+        return result
+    })
 }
 
 // --- 3C. Project Operations ---
@@ -6057,13 +6046,12 @@ function closeProject(reqInfo) {
     }
 }
 
-const FRAGMENT_EXPORT_ALLOWED_FIELDS = ['elementId', 'path']
+const FRAGMENT_EXPORT_ALLOWED_FIELDS = ['elementId']
 
 function exportFragment(body, reqInfo) {
     const err = validate([
         checkUnknownFields(body, FRAGMENT_EXPORT_ALLOWED_FIELDS),
-        checkFieldType(body, 'elementId', 'string'),
-        checkFieldType(body, 'path', 'string')
+        checkFieldType(body, 'elementId', 'string')
     ])
     if (err) {
         return validationError(err, reqInfo, body)
@@ -6072,26 +6060,22 @@ function exportFragment(body, reqInfo) {
     if (!body.elementId) {
         return validationError('Field "elementId" is required', reqInfo, body)
     }
-    if (!body.path) {
-        return validationError('Field "path" is required', reqInfo, body)
-    }
-
-    if (body.path.charAt(0) !== '/' && !/^[a-zA-Z]:[/\\]/.test(body.path)) {
-        return validationError('Field "path" must be an absolute path', reqInfo, body)
-    }
 
     const element = findById(body.elementId)
     if (!element) {
         return validationError('Element not found: ' + body.elementId, reqInfo, body)
     }
 
+    const nodePath = require('path')
+    const fileName = (element.name || element._id).replace(/[/\\:*?"<>|]/g, '_') + '.mfj'
+    const tempDir = fileTransfer.makeTempDir()
     try {
-        app.project.exportToFile(element, body.path)
+        app.project.exportToFile(element, nodePath.join(tempDir, fileName))
         return {
             success: true,
-            message: 'Exported element "' + (element.name || body.elementId) + '" to "' + body.path + '"',
+            message: 'Exported element "' + (element.name || body.elementId) + '"',
             request: Object.assign({}, reqInfo, { body: body }),
-            data: { elementId: body.elementId, path: body.path }
+            data: { elementId: body.elementId, file: fileTransfer.readFileEntry(nodePath.join(tempDir, fileName), fileName) }
         }
     } catch (e) {
         return {
@@ -6099,6 +6083,8 @@ function exportFragment(body, reqInfo) {
             error: 'Failed to export fragment: ' + (e.message || String(e)),
             request: Object.assign({}, reqInfo, { body: body })
         }
+    } finally {
+        fileTransfer.removeTempDir(tempDir)
     }
 }
 
@@ -6804,22 +6790,20 @@ function createLinkObject(diagramId, body, reqInfo) {
 
 // --- #10. HTML / Markdown Export ---
 
-const DOC_EXPORT_ALLOWED_FIELDS = ['path', 'format']
+const DOC_EXPORT_ALLOWED_FIELDS = ['format']
 const VALID_DOC_EXPORT_FORMATS = ['html', 'markdown']
+
+const DOC_EXPORT_COMMANDS = { html: 'html-export:export', markdown: 'markdown:export' }
 
 function exportDocument(body, reqInfo) {
     const err = validate([
         checkUnknownFields(body, DOC_EXPORT_ALLOWED_FIELDS),
-        checkFieldType(body, 'path', 'string'),
         checkFieldType(body, 'format', 'string')
     ])
     if (err) {
         return validationError(err, reqInfo, body)
     }
 
-    if (!body.path) {
-        return validationError('Field "path" is required', reqInfo, body)
-    }
     if (!body.format) {
         return validationError('Field "format" is required. Allowed: ' + VALID_DOC_EXPORT_FORMATS.join(', '), reqInfo, body)
     }
@@ -6827,31 +6811,45 @@ function exportDocument(body, reqInfo) {
         return validationError('Invalid format "' + body.format + '". Allowed: ' + VALID_DOC_EXPORT_FORMATS.join(', '), reqInfo, body)
     }
 
-    const path = require('path')
-    if (!path.isAbsolute(body.path)) {
-        return validationError('path must be absolute', reqInfo, body)
+    const reqInfoWithBody = Object.assign({}, reqInfo, { body: body })
+
+    // The export is done by a StarUML command. Not every StarUML version provides every exporter.
+    const command = DOC_EXPORT_COMMANDS[body.format]
+    if (!app.commands.commands[command]) {
+        return {
+            success: false,
+            error: 'This StarUML does not provide the "' + body.format + '" document export (command "' + command + '" is not registered)',
+            request: reqInfoWithBody
+        }
     }
 
-    try {
-        if (body.format === 'html') {
-            app.commands.execute('html-export:export', body.path)
-        } else {
-            app.commands.execute('markdown:export', body.path)
-        }
+    const nodePath = require('path')
+    const tempDir = fileTransfer.makeTempDir()
+    const outDir = nodePath.join(tempDir, 'out')
 
+    return Promise.resolve().then(function () {
+        return app.commands.execute(command, outDir)
+    }).then(function () {
+        const files = require('fs').existsSync(outDir) ? fileTransfer.readDirEntries(outDir) : []
+        if (files.length === 0) {
+            return { success: false, error: 'The "' + body.format + '" export produced no files', request: reqInfoWithBody }
+        }
         return {
             success: true,
-            message: 'Exported project as ' + body.format + ' to ' + body.path,
-            request: Object.assign({}, reqInfo, { body: body }),
-            data: { format: body.format, path: body.path }
+            message: 'Exported project as ' + body.format + ' (' + files.length + ' file(s))',
+            request: reqInfoWithBody,
+            data: { format: body.format, count: files.length, files: files }
         }
-    } catch (e) {
+    }).catch(function (e) {
         return {
             success: false,
             error: 'Failed to export: ' + (e.message || String(e)),
-            request: Object.assign({}, reqInfo, { body: body })
+            request: reqInfoWithBody
         }
-    }
+    }).then(function (result) {
+        fileTransfer.removeTempDir(tempDir)
+        return result
+    })
 }
 
 // ============================================================

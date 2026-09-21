@@ -2,15 +2,43 @@
  * StarUML Controller - Main Entry Point
  *
  * Provides an HTTP server within StarUML to allow remote control
- * of ER diagrams via REST API.
+ * of diagrams via REST API. Every request must carry the password
+ * chosen at server start (Authorization: Bearer <password>).
  */
 
 const http = require('http')
+const crypto = require('crypto')
+const { clipboard } = require('electron')
 const apiHandler = require('./api-handler')
 
 const DEFAULT_PORT = 12345
+const PASSWORD_PREFERENCE_KEY = 'staruml-controller.password'
 let server = null
 let currentPort = null
+let currentPassword = null
+
+/**
+ * The saved password, or a new random UUID if none is saved yet
+ */
+function getSavedOrNewPassword() {
+  return app.preferences.get(PASSWORD_PREFERENCE_KEY) || crypto.randomUUID()
+}
+
+/**
+ * Compare in constant time so that response timing does not leak the password
+ */
+function isAuthorized(req) {
+  if (!currentPassword) {
+    return false
+  }
+  const header = req.headers['authorization']
+  if (typeof header !== 'string') {
+    return false
+  }
+  const expected = crypto.createHash('sha256').update('Bearer ' + currentPassword).digest()
+  const actual = crypto.createHash('sha256').update(header).digest()
+  return crypto.timingSafeEqual(expected, actual)
+}
 
 /**
  * Send JSON response with appropriate status code
@@ -31,23 +59,24 @@ function sendResponse(res, result) {
 /**
  * Start the HTTP server
  */
-function startServer(port) {
+function startServer(port, password) {
   if (server) {
     app.toast.warning('Server is already running on port ' + currentPort)
     return
   }
 
+  currentPassword = password
+
   server = http.createServer(function (req, res) {
-    // CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
     res.setHeader('Content-Type', 'application/json; charset=utf-8')
 
-    // Handle preflight
-    if (req.method === 'OPTIONS') {
-      res.writeHead(200)
-      res.end()
+    // Reject before reading the body. No CORS headers are sent, so browsers
+    // cannot call this API from web pages.
+    if (!isAuthorized(req)) {
+      res.setHeader('WWW-Authenticate', 'Bearer')
+      res.writeHead(401)
+      res.end(JSON.stringify({ success: false, error: 'Unauthorized: send the server password as "Authorization: Bearer <password>"' }, null, 2))
+      req.resume()
       return
     }
 
@@ -123,12 +152,14 @@ function startServer(port) {
     }
     server = null
     currentPort = null
+    currentPassword = null
   })
 
   server.listen(port, function () {
     currentPort = port
+    clipboard.writeText(password)
     console.log('[StarUML Controller] Server started on port ' + port)
-    app.toast.info('StarUML Controller server started on port ' + port)
+    app.toast.info('StarUML Controller server started on port ' + port + '. Password copied to clipboard.')
   })
 }
 
@@ -146,11 +177,54 @@ function stopServer() {
     app.toast.info('StarUML Controller server stopped')
     server = null
     currentPort = null
+    currentPassword = null
   })
 }
 
 /**
- * Handle start server command - show port dialog then start
+ * Dialog that asks for the port and the password at once.
+ * The OK button is not a ".dialog-button", so the dialog stays open while the input is invalid.
+ */
+const START_DIALOG_TEMPLATE = [
+  '<div class="staruml-controller-start-dialog dialog modal" data-title="Start StarUML Controller Server">',
+  '  <div class="dialog-body" style="width: 30em">',
+  '    <div class="dialog-message">Port</div>',
+  '    <input type="text" class="k-input k-textbox port" style="width: 100%; margin-bottom: 1em">',
+  '    <div class="dialog-message">Password</div>',
+  '    <input type="text" class="k-input k-textbox password" style="width: 100%" spellcheck="false">',
+  '    <div style="margin-top: 0.5em">',
+  '      <button class="k-button regenerate">Regenerate</button>',
+  '      <button class="k-button copy">Copy</button>',
+  '      <span class="copied" style="margin-left: 0.5em; display: none">Copied</span>',
+  '    </div>',
+  '    <div class="dialog-message" style="margin-top: 1em">Clients must send the password with every request. It is copied to the clipboard when the server starts.</div>',
+  '    <div class="error" style="margin-top: 0.5em; color: #e0504a; display: none"></div>',
+  '  </div>',
+  '  <div class="dialog-footer">',
+  '    <button class="k-button primary start">Start Server</button>',
+  '    <button class="k-button dialog-button" data-button-id="cancel">Cancel</button>',
+  '  </div>',
+  '</div>'
+].join('\n')
+
+/**
+ * Validate the dialog input. Returns { port, password } or { error }.
+ */
+function readStartInput(portText, passwordText) {
+  const portValue = String(portText).trim()
+  const port = parseInt(portValue, 10)
+  if (!/^[0-9]+$/.test(portValue) || port < 1 || port > 65535) {
+    return { error: 'Invalid port number. Please enter a number between 1 and 65535.' }
+  }
+  const password = String(passwordText).trim()
+  if (password === '') {
+    return { error: 'The password must not be empty.' }
+  }
+  return { port: port, password: password }
+}
+
+/**
+ * Handle start server command - ask for the port and the password, then start
  */
 function handleStartServer() {
   if (server) {
@@ -158,18 +232,47 @@ function handleStartServer() {
     return
   }
 
-  app.dialogs.showInputDialog(
-    'Enter the port number for the controller server:',
-    String(DEFAULT_PORT)
-  ).then(function (result) {
-    if (result.buttonId === 'ok') {
-      const port = parseInt(result.returnValue, 10)
-      if (isNaN(port) || port < 1 || port > 65535) {
-        app.dialogs.showErrorDialog('Invalid port number. Please enter a number between 1 and 65535.')
-        return
-      }
-      startServer(port)
+  const dialog = app.dialogs.showModalDialogUsingTemplate(START_DIALOG_TEMPLATE, true)
+  const $dlg = dialog.getElement()
+  const $port = $dlg.find('.port')
+  const $password = $dlg.find('.password')
+  const $error = $dlg.find('.error')
+  const $copied = $dlg.find('.copied')
+
+  $port.val(String(DEFAULT_PORT))
+  $password.val(getSavedOrNewPassword())
+  $port.focus().select()
+
+  $dlg.find('.regenerate').click(function () {
+    $password.val(crypto.randomUUID())
+    $copied.hide()
+  })
+
+  $dlg.find('.copy').click(function () {
+    clipboard.writeText(String($password.val()).trim())
+    $copied.show()
+  })
+
+  $password.on('input', function () {
+    $copied.hide()
+  })
+
+  $dlg.find('.start').click(function () {
+    const input = readStartInput($port.val(), $password.val())
+    if (input.error) {
+      $error.text(input.error).show()
+      return
     }
+    $dlg.data('returnValue', input)
+    dialog.close('ok')
+  })
+
+  dialog.then(function (result) {
+    if (result.buttonId !== 'ok') {
+      return
+    }
+    app.preferences.set(PASSWORD_PREFERENCE_KEY, result.returnValue.password)
+    startServer(result.returnValue.port, result.returnValue.password)
   })
 }
 

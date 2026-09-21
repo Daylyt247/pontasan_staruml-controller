@@ -58,7 +58,8 @@ Designed for integration with AI tools such as Claude Code (via MCP) to programm
 - **Mermaid import** - generate StarUML diagrams from Mermaid syntax (class, sequence, flowchart, ER, mindmap, requirement, state)
 - **Diagram generation** - auto-generate overview, type hierarchy, or package structure diagrams from model
 - **Project management** - save, open, new, close, import/export model fragments
-- **CORS enabled** - accessible from any origin
+- **Password authentication** - every request must carry the password chosen at server start; a random UUID is proposed automatically, copied to the clipboard, and can be regenerated
+- **No writes to client-given paths** - exported files (images, DDL, documents, fragments) are returned in the response, so a remote client receives them on its own machine
 
 ## Installation
 
@@ -89,13 +90,36 @@ Restart StarUML to load the extension.
   <img src="images/image4.jpg" alt="Tools menu showing StarUML Controller submenu with Start Server and Stop Server options" width="700">
 </p>
 
-3. A dialog appears asking for the port number. Enter a port (default: `12345`) and click **OK**
+3. A dialog asks for the port (default: `12345`) and the password. A random UUID is filled in as the password automatically; keep it, press **Regenerate** for a new one, or type your own (it must not be empty). **Copy** copies it to the clipboard. Click **Start Server**. Invalid input is reported in the dialog without closing it
 
 <p align="center">
-  <img src="images/image5.jpg" alt="Port number input dialog with default value 12345" width="400">
+  <img src="images/image5.jpg" alt="Start dialog with the port and the password" width="400">
 </p>
 
-4. The HTTP server starts and all diagrams become accessible via REST API
+4. The HTTP server starts and all diagrams become accessible via REST API. The password is copied to the clipboard, because every client needs it
+
+The password is remembered and filled in again at the next start.
+
+### Authentication
+
+Every request must send the password:
+
+```
+Authorization: Bearer <password>
+```
+
+A request without the correct password is answered with `401` and `{ "success": false, "error": "Unauthorized: ..." }`. The MCP servers take the password from the `STARUML_PASSWORD` environment variable.
+
+To copy the password again or to change it, stop the server and open **Start Server...** again. The dialog shows the saved password; **Copy** copies it, and **Regenerate** fills in a new random UUID. A changed password takes effect when the server starts, so update your clients afterwards.
+
+### Security Notes
+
+- The server listens on all network interfaces, so other machines on the network can reach it. The password is what protects it.
+- The connection is plain HTTP. Anyone who can observe the network traffic can read the password and the data, so use it only on a network you trust.
+- No CORS headers are sent, so web pages opened in a browser cannot call the API.
+- The password is stored in the StarUML preferences without encryption. Other programs running as the same user on the StarUML machine can read it.
+- `POST /api/project/save` and `POST /api/project/open` work with `.mdj` paths on the StarUML machine. All other file outputs are returned in the response and nothing is written to a path given by the client.
+- Several people can control one StarUML at the same time, but they share one project and one undo history. Coordinating is up to the users.
 
 ### Stopping the Server
 
@@ -120,7 +144,7 @@ Select **Tools > StarUML Controller > Stop Server** from the menu bar.
 | `/api/diagrams/:id` | GET / PUT / DELETE | Get, update, or delete diagram |
 | `/api/diagrams/:id/elements` | GET / POST | List or create node elements |
 | `/api/diagrams/:id/relations` | POST | Create relations |
-| `/api/diagrams/:id/export` | POST | Export diagram (PNG/JPEG/SVG/PDF) |
+| `/api/diagrams/:id/export` | POST | Export diagram (PNG/JPEG/SVG/PDF); the image is returned in the response |
 | `/api/diagrams/:id/layout` | POST | Auto-layout diagram |
 | `/api/diagrams/:id/open` | POST | Open diagram in editor |
 | `/api/diagrams/:id/zoom` | PUT | Set zoom level |
@@ -143,10 +167,10 @@ Select **Tools > StarUML Controller > Stop Server** from the menu bar.
 | `/api/project/open` | POST | Open project |
 | `/api/project/new` | POST | Create new project |
 | `/api/project/close` | POST | Close project |
-| `/api/project/import` | POST | Import model fragment |
-| `/api/project/export` | POST | Export model fragment |
-| `/api/project/export-all` | POST | Export all diagrams as images |
-| `/api/project/export-doc` | POST | Export project as HTML/Markdown |
+| `/api/project/import` | POST | Import model fragment sent in the request |
+| `/api/project/export` | POST | Export model fragment; returned in the response |
+| `/api/project/export-all` | POST | Export all diagrams as images; returned in the response |
+| `/api/project/export-doc` | POST | Export project as HTML/Markdown; the files are returned in the response. Markdown needs a StarUML that provides a Markdown exporter |
 | `/api/undo` | POST | Undo last operation |
 | `/api/redo` | POST | Redo last undone operation |
 | `/api/search` | GET | Search elements by keyword |
@@ -172,7 +196,7 @@ Select **Tools > StarUML Controller > Stop Server** from the menu bar.
 | `/api/erd/indexes/:id` | GET / PUT / DELETE | Get, update, or delete index |
 | `/api/erd/relationships` | GET / POST | List (filterable) or create relationships |
 | `/api/erd/relationships/:id` | GET / PUT / DELETE | Get, update, or delete relationship |
-| `/api/erd/postgresql/ddl` | POST | Generate PostgreSQL DDL to a file |
+| `/api/erd/postgresql/ddl` | POST | Generate PostgreSQL DDL; the text is returned in the response |
 
 ### Sequence Diagram
 
@@ -617,122 +641,129 @@ For full API specifications including request/response formats, validation rules
 
 ## Examples
 
+Files are exchanged as file entries: `{ "path": "<file name>", "encoding": "utf8" | "base64", "content": "<text or base64>" }`. Text files (`.sql`, `.svg`, `.html`, `.mfj`, ...) use `utf8`, binary files (`.png`, `.jpeg`, `.pdf`, ...) use `base64`.
+
 ```bash
+# Every request needs the password entered at server start
+AUTH="Authorization: Bearer <password>"
+
 # Health check
-curl http://localhost:12345/api/status
+curl -H "$AUTH" http://localhost:12345/api/status
 
 # Create a data model
-curl -X POST http://localhost:12345/api/erd/data-models \
+curl -H "$AUTH" -X POST http://localhost:12345/api/erd/data-models \
   -H "Content-Type: application/json" \
   -d '{"name": "MyDB"}'
 
 # Create a diagram
-curl -X POST http://localhost:12345/api/erd/diagrams \
+curl -H "$AUTH" -X POST http://localhost:12345/api/erd/diagrams \
   -H "Content-Type: application/json" \
   -d '{"parentId": "DATA_MODEL_ID", "name": "Main ER Diagram"}'
 
 # Create entity with diagram placement
-curl -X POST http://localhost:12345/api/erd/entities \
+curl -H "$AUTH" -X POST http://localhost:12345/api/erd/entities \
   -H "Content-Type: application/json" \
   -d '{"parentId": "DATA_MODEL_ID", "name": "users", "diagramId": "DIAGRAM_ID"}'
 
 # Add column
-curl -X POST http://localhost:12345/api/erd/entities/ENTITY_ID/columns \
+curl -H "$AUTH" -X POST http://localhost:12345/api/erd/entities/ENTITY_ID/columns \
   -H "Content-Type: application/json" \
   -d '{"name": "email", "type": "VARCHAR", "length": "255", "unique": true}'
 
 # Set foreign key reference
-curl -X PUT http://localhost:12345/api/erd/columns/COLUMN_ID \
+curl -H "$AUTH" -X PUT http://localhost:12345/api/erd/columns/COLUMN_ID \
   -H "Content-Type: application/json" \
   -d '{"foreignKey": true, "referenceToId": "TARGET_COLUMN_ID"}'
 
 # Create relationship
-curl -X POST http://localhost:12345/api/erd/relationships \
+curl -H "$AUTH" -X POST http://localhost:12345/api/erd/relationships \
   -H "Content-Type: application/json" \
   -d '{"parentId": "DATA_MODEL_ID", "diagramId": "DIAGRAM_ID", "end1": {"reference": "ENTITY1_ID", "cardinality": "1"}, "end2": {"reference": "ENTITY2_ID", "cardinality": "0..*"}}'
 
 # Create sequence
-curl -X POST http://localhost:12345/api/erd/entities/ENTITY_ID/sequences \
+curl -H "$AUTH" -X POST http://localhost:12345/api/erd/entities/ENTITY_ID/sequences \
   -H "Content-Type: application/json" \
   -d '{"name": "users_id_seq"}'
 
 # Create index
-curl -X POST http://localhost:12345/api/erd/entities/ENTITY_ID/indexes \
+curl -H "$AUTH" -X POST http://localhost:12345/api/erd/entities/ENTITY_ID/indexes \
   -H "Content-Type: application/json" \
   -d '{"name": "idx_email", "definition": "CREATE INDEX idx_email ON users (email)"}'
 
 # Set default value on a column (via tag)
-curl -X POST http://localhost:12345/api/elements/COLUMN_ID/tags \
+curl -H "$AUTH" -X POST http://localhost:12345/api/elements/COLUMN_ID/tags \
   -H "Content-Type: application/json" \
   -d '{"name": "default", "kind": 0, "value": "now()"}'
 
 # Generate PostgreSQL DDL
-curl -X POST http://localhost:12345/api/erd/postgresql/ddl \
+# The DDL text is in data.file.content. A fileName ending with _create.sql / _drop.sql
+# limits the output to CREATE / DROP statements.
+curl -H "$AUTH" -X POST http://localhost:12345/api/erd/postgresql/ddl \
   -H "Content-Type: application/json" \
-  -d '{"path": "/Users/xxx/output.sql"}'
+  -d '{"fileName": "output.sql"}' | jq -r '.data.file.content' > output.sql
 
-# Save project
-curl -X POST http://localhost:12345/api/project/save \
+# Save project (the path is on the machine running StarUML)
+curl -H "$AUTH" -X POST http://localhost:12345/api/project/save \
   -H "Content-Type: application/json" \
   -d '{"path": "/Users/xxx/my-project.mdj"}'
 
 # Delete entity (blocked if referenced by other elements)
-curl -X DELETE http://localhost:12345/api/erd/entities/ENTITY_ID
+curl -H "$AUTH" -X DELETE http://localhost:12345/api/erd/entities/ENTITY_ID
 
 # --- Generic Diagrams ---
 
 # Create a BPMN diagram
-curl -X POST http://localhost:12345/api/diagrams \
+curl -H "$AUTH" -X POST http://localhost:12345/api/diagrams \
   -H "Content-Type: application/json" \
   -d '{"type": "BPMNDiagram", "name": "My Process"}'
 
 # Create a node element on a diagram
-curl -X POST http://localhost:12345/api/diagrams/DIAGRAM_ID/elements \
+curl -H "$AUTH" -X POST http://localhost:12345/api/diagrams/DIAGRAM_ID/elements \
   -H "Content-Type: application/json" \
   -d '{"type": "BPMNTask", "name": "Review Order"}'
 
 # Create a relation between elements
-curl -X POST http://localhost:12345/api/diagrams/DIAGRAM_ID/relations \
+curl -H "$AUTH" -X POST http://localhost:12345/api/diagrams/DIAGRAM_ID/relations \
   -H "Content-Type: application/json" \
   -d '{"type": "BPMNSequenceFlow", "sourceId": "ELEMENT1_ID", "targetId": "ELEMENT2_ID"}'
 
 # Export diagram as PNG
-curl -X POST http://localhost:12345/api/diagrams/DIAGRAM_ID/export \
+curl -H "$AUTH" -X POST http://localhost:12345/api/diagrams/DIAGRAM_ID/export \
   -H "Content-Type: application/json" \
-  -d '{"format": "png", "path": "/tmp/diagram.png"}'
+  -d '{"format": "png"}' | jq -r '.data.file.content' | base64 --decode > diagram.png
 
 # Search elements
-curl "http://localhost:12345/api/search?keyword=User&type=UMLClass"
+curl -H "$AUTH" "http://localhost:12345/api/search?keyword=User&type=UMLClass"
 
 # --- Sequence Diagram ---
 
 # Create an interaction
-curl -X POST http://localhost:12345/api/seq/interactions \
+curl -H "$AUTH" -X POST http://localhost:12345/api/seq/interactions \
   -H "Content-Type: application/json" \
   -d '{"name": "Login Flow"}'
 
 # Create a sequence diagram
-curl -X POST http://localhost:12345/api/seq/diagrams \
+curl -H "$AUTH" -X POST http://localhost:12345/api/seq/diagrams \
   -H "Content-Type: application/json" \
   -d '{"parentId": "INTERACTION_ID", "name": "Login Sequence"}'
 
 # Create lifelines with diagram placement
-curl -X POST http://localhost:12345/api/seq/interactions/INTERACTION_ID/lifelines \
+curl -H "$AUTH" -X POST http://localhost:12345/api/seq/interactions/INTERACTION_ID/lifelines \
   -H "Content-Type: application/json" \
   -d '{"name": "Client", "diagramId": "DIAGRAM_ID"}'
 
 # Create a message between lifelines
-curl -X POST http://localhost:12345/api/seq/interactions/INTERACTION_ID/messages \
+curl -H "$AUTH" -X POST http://localhost:12345/api/seq/interactions/INTERACTION_ID/messages \
   -H "Content-Type: application/json" \
   -d '{"name": "login()", "messageSort": "synchCall", "source": "LIFELINE1_ID", "target": "LIFELINE2_ID", "diagramId": "DIAGRAM_ID"}'
 
 # Create a combined fragment (alt/opt/loop)
-curl -X POST http://localhost:12345/api/seq/interactions/INTERACTION_ID/combined-fragments \
+curl -H "$AUTH" -X POST http://localhost:12345/api/seq/interactions/INTERACTION_ID/combined-fragments \
   -H "Content-Type: application/json" \
   -d '{"interactionOperator": "alt", "diagramId": "DIAGRAM_ID"}'
 
 # Add operand to a combined fragment
-curl -X POST http://localhost:12345/api/seq/combined-fragments/FRAGMENT_ID/operands \
+curl -H "$AUTH" -X POST http://localhost:12345/api/seq/combined-fragments/FRAGMENT_ID/operands \
   -H "Content-Type: application/json" \
   -d '{"guard": "[success]"}'
 ```
@@ -741,12 +772,13 @@ curl -X POST http://localhost:12345/api/seq/combined-fragments/FRAGMENT_ID/opera
 
 ```
 staruml-controller/
-├── main.js            # Extension entry point (HTTP server management)
+├── main.js            # Extension entry point (HTTP server management, password authentication)
 ├── api-handler.js     # REST API routing and handlers
 ├── ddl-generator.js   # PostgreSQL DDL generation
 ├── handlers/
 │   ├── shared-helpers.js   # Shared validation/serialization utilities
 │   ├── crud-factory.js     # CRUD handler factory engine
+│   ├── file-transfer.js    # Returns exported files in the response (temporary directory handling)
 │   ├── family-class.js     # Class/Package diagram config
 │   ├── family-usecase.js   # Use Case diagram config
 │   ├── family-activity.js  # Activity diagram config
@@ -761,7 +793,7 @@ staruml-controller/
 │   ├── image2.jpg     # PostgreSQL DDL export screenshot
 │   ├── image3.gif     # Sequence diagram demo animation
 │   ├── image4.jpg     # Tools menu screenshot
-│   └── image5.jpg     # Port number dialog screenshot
+│   └── image5.jpg     # Start dialog (port and password) screenshot
 ├── test/
 │   └── test_all_endpoints.sh  # Integration test script
 ├── package.json       # Extension metadata

@@ -6,13 +6,23 @@
 #   - StarUML running with StarUML Controller extension
 #   - Server started (Tools > StarUML Controller > Start Server)
 #   - Default port 12345 (or set PORT env var)
+#   - STARUML_PASSWORD set to the password entered at server start
 #
 # Usage:
-#   bash test/test_all_endpoints.sh
-#   PORT=3000 bash test/test_all_endpoints.sh
+#   STARUML_PASSWORD=<password> bash test/test_all_endpoints.sh
+#   STARUML_PASSWORD=<password> PORT=3000 bash test/test_all_endpoints.sh
 #
 
 BASE="http://localhost:${PORT:-12345}"
+
+if [ -z "$STARUML_PASSWORD" ]; then
+    echo "ERROR: STARUML_PASSWORD is not set."
+    echo "Set it to the password shown when the StarUML Controller server was started."
+    exit 2
+fi
+
+# Every request carries the server password
+curl() { command curl -H "Authorization: Bearer $STARUML_PASSWORD" "$@"; }
 PASS=0
 FAIL=0
 TOTAL_RESULTS=""
@@ -32,6 +42,37 @@ check() {
         FAIL=$((FAIL+1))
         local err=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','unknown')[:80])" 2>/dev/null || echo "parse error")
         TOTAL_RESULTS="${TOTAL_RESULTS}FAIL ${label} : ${err}\n"
+    fi
+}
+
+# Check that a response carries a file entry ({path, encoding, content}) whose content matches a pattern.
+# The controller returns file contents in the response; it never writes to a client-given path.
+# Usage: check_file <label> <response> <utf8|base64> <python expression on "data" (bytes)>
+check_file() {
+    local label="$1"
+    local result=$(echo "$2" | python3 -c "
+import sys, json, base64
+r = json.load(sys.stdin)
+if not r.get('success'):
+    print('FAIL ' + str(r.get('error', 'unknown'))[:80]); sys.exit()
+d = r['data']
+files = d['files'] if 'files' in d else [d['file']]
+if not files:
+    print('FAIL no file in response'); sys.exit()
+for f in files:
+    if f.get('encoding') != sys.argv[1]:
+        print('FAIL encoding of ' + f.get('path', '?') + ' is ' + str(f.get('encoding'))); sys.exit()
+    data = base64.b64decode(f['content']) if f['encoding'] == 'base64' else f['content'].encode('utf-8')
+    if not eval(sys.argv[2]):
+        print('FAIL unexpected content in ' + f['path']); sys.exit()
+print('OK')
+" "$3" "$4" 2>/dev/null || echo "FAIL parse error")
+    if [ "$result" = "OK" ]; then
+        PASS=$((PASS+1))
+        TOTAL_RESULTS="${TOTAL_RESULTS}OK   ${label}\n"
+    else
+        FAIL=$((FAIL+1))
+        TOTAL_RESULTS="${TOTAL_RESULTS}FAIL ${label} : ${result#FAIL }\n"
     fi
 }
 
@@ -163,8 +204,8 @@ check "40.erd_update_relationship" "$(curl -s -X PUT $BASE/api/erd/relationships
 # =============================
 # ERD DDL: generate (1)
 # =============================
-DDL_BODY=$(printf '{"dataModelId":"%s","path":"/tmp/test_ddl.sql"}' "$DM_ID")
-check "41.erd_generate_ddl" "$(curl -s -X POST $BASE/api/erd/postgresql/ddl -H "Content-Type: application/json" -d "$DDL_BODY")"
+DDL_BODY=$(printf '{"dataModelId":"%s","fileName":"test_ddl.sql"}' "$DM_ID")
+check_file "41.erd_generate_ddl" "$(curl -s -X POST $BASE/api/erd/postgresql/ddl -H "Content-Type: application/json" -d "$DDL_BODY")" utf8 "b'-- PostgreSQL DDL' in data"
 
 # =============================
 # Seq Interactions: create, list, get, update (4) + delete later
@@ -345,12 +386,12 @@ check "204.gen_delete_shape" "$(curl -s -X DELETE $BASE/api/shapes/$(enc $SHAPE_
 # =============================
 # Generic: Diagram Export (3)
 # =============================
-check "92.gen_export_png" "$(curl -s -X POST $BASE/api/diagrams/$(enc $DG_ID)/export -H "Content-Type: application/json" -d '{"path":"/tmp/test_export.png","format":"png"}')"
-check "93.gen_export_svg" "$(curl -s -X POST $BASE/api/diagrams/$(enc $DG_ID)/export -H "Content-Type: application/json" -d '{"path":"/tmp/test_export.svg","format":"svg"}')"
+check_file "92.gen_export_png" "$(curl -s -X POST $BASE/api/diagrams/$(enc $DG_ID)/export -H "Content-Type: application/json" -d '{"format":"png"}')" base64 "data[:4] == b'\x89PNG'"
+check_file "93.gen_export_svg" "$(curl -s -X POST $BASE/api/diagrams/$(enc $DG_ID)/export -H "Content-Type: application/json" -d '{"format":"svg"}')" utf8 "b'<svg' in data"
 R=$(curl -s -X POST $BASE/api/diagrams/$(enc $DG_ID)/export -H 'Content-Type: application/json' \
-  -d "{\"format\":\"jpeg\",\"path\":\"/tmp/test_export.jpeg\"}")
-check "94.erd_export_jpeg" "$R"
-check "205.gen_export_pdf" "$(curl -s -X POST $BASE/api/diagrams/$(enc $DG_ID)/export -H "Content-Type: application/json" -d '{"path":"/tmp/test_export.pdf","format":"pdf"}')"
+  -d "{\"format\":\"jpeg\"}")
+check_file "94.erd_export_jpeg" "$R" base64 "data[:2] == b'\xff\xd8'"
+check_file "205.gen_export_pdf" "$(curl -s -X POST $BASE/api/diagrams/$(enc $DG_ID)/export -H "Content-Type: application/json" -d '{"format":"pdf"}')" base64 "data[:5] == b'%PDF-' and b'%%EOF' in data[-32:]"
 
 # =============================
 # Generic: Element Update + Delete (3)
@@ -833,21 +874,21 @@ check "258.gen_validate_model" "$(curl -s -X POST $BASE/api/validate)"
 # =============================
 # New API: Export All Diagrams (1)
 # =============================
-mkdir -p /tmp/staruml_export_test
-check "259.gen_export_all" "$(curl -s -X POST $BASE/api/project/export-all -H 'Content-Type: application/json' -d '{"path":"/tmp/staruml_export_test","format":"png"}')"
+check_file "259.gen_export_all" "$(curl -s -X POST $BASE/api/project/export-all -H 'Content-Type: application/json' -d '{"format":"png"}')" base64 "data[:4] == b'\x89PNG'"
 
 # =============================
 # New API: Export Fragment (1)
 # =============================
 R=$(curl -s -X POST $BASE/api/project/export -H 'Content-Type: application/json' \
-  -d "{\"elementId\":\"$GD_C1_MID\",\"path\":\"/tmp/test_fragment.mfj\"}")
-check "260.gen_export_fragment" "$R"
+  -d "{\"elementId\":\"$GD_C1_MID\"}")
+check_file "260.gen_export_fragment" "$R" utf8 "b'\"_type\"' in data"
+FRAGMENT_FILE=$(echo "$R" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin)['data']['file']))" 2>/dev/null)
 
 # =============================
 # New API: Import Fragment (1)
 # =============================
 R=$(curl -s -X POST $BASE/api/project/import -H 'Content-Type: application/json' \
-  -d "{\"path\":\"/tmp/test_fragment.mfj\"}")
+  -d "{\"file\":$FRAGMENT_FILE}")
 check "261.gen_import_fragment" "$R"
 
 # =============================
@@ -969,7 +1010,7 @@ fi
 # Export Doc: POST /api/project/export-doc (1)
 # =============================
 R=$(curl -s -X POST $BASE/api/project/export-doc -H "Content-Type: application/json" \
-  -d '{"path":"/tmp/staruml_test_doc","format":"html"}')
+  -d '{"format":"html"}')
 check "269c.gen_export_doc_html" "$R"
 
 # =============================
@@ -1514,8 +1555,7 @@ echo "Restoring project from snapshot..."
 curl -s -X POST $BASE/api/project/open -H "Content-Type: application/json" -d "{\"path\":\"$SNAPSHOT\"}" > /dev/null
 
 # Cleanup temp files
-rm -f /tmp/test_export.png /tmp/test_export.svg /tmp/test_export.jpeg /tmp/test_export.pdf /tmp/test_ddl.sql /tmp/test_fragment.mfj /tmp/test_staruml.mdj "$SNAPSHOT"
-rm -rf /tmp/staruml_export_test /tmp/staruml_test_doc
+rm -f /tmp/test_staruml.mdj "$SNAPSHOT"
 
 # =============================
 # Results
